@@ -2,8 +2,16 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: projet-cinema-deployment
+  labels:
+    app: projet-cinema
+    version: "1.0"  # À mettre à jour avec chaque déploiement
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1       # Nombre maximum de pods supplémentaires pendant la mise à jour
+      maxUnavailable: 0 # Aucun downtime pendant les mises à jour
   selector:
     matchLabels:
       app: projet-cinema
@@ -14,19 +22,47 @@ spec:
     spec:
       containers:
       - name: projet-cinema
-        image: omarelhedfi/projet_cinema:latest
+        image: omarelhedfi/projet_cinema:latest  # À remplacer par votre image
+        imagePullPolicy: Always  # Pour toujours tirer la dernière version
         ports:
         - containerPort: 8080
+          protocol: TCP
+        resources:
+          requests:
+            cpu: "100m"  # 0.1 CPU
+            memory: "128Mi"
+          limits:
+            cpu: "500m"  # 0.5 CPU
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health  # Endpoint de santé
+            port: 8080
+          initialDelaySeconds: 30   # Délai avant première vérification
+          periodSeconds: 10         # Fréquence des vérifications
+        readinessProbe:
+          httpGet:
+            path: /actuator/health  # Endpoint de readiness
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "prod"  # Configuration Spring spécifique
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: projet-cinema-service
+  labels:
+    app: projet-cinema
 spec:
   type: NodePort
   selector:
     app: projet-cinema
   ports:
-    - port: 8080
-      targetPort: 8080
-      nodePort: 30008
+    - name: http
+      protocol: TCP
+      port: 8080        # Port interne du service
+      targetPort: 8080  # Port du conteneur
+      nodePort: 30008   # Port externe (30000-32767)
