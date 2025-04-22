@@ -25,7 +25,7 @@ spec:
         image: omarelhedfi/projet_cinema:latest  # À remplacer par votre image
         imagePullPolicy: Always  # Pour toujours tirer la dernière version
         ports:
-        - containerPort: 8080
+        - containerPort: 8082
           protocol: TCP
         resources:
           requests:
@@ -63,6 +63,6 @@ spec:
   ports:
     - name: http
       protocol: TCP
-      port: 8080        # Port interne du service
-      targetPort: 8080  # Port du conteneur
+      port: 8082        # Port interne du service
+      targetPort: 8082  # Port du conteneur
       nodePort: 30008   # Port externe (30000-32767)
