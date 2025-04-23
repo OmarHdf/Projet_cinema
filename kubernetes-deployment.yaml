@@ -37,13 +37,13 @@ spec:
         livenessProbe:
           httpGet:
             path: /actuator/health  # Endpoint de santé
-            port: 8080
+            port: 8082
           initialDelaySeconds: 30   # Délai avant première vérification
           periodSeconds: 10         # Fréquence des vérifications
         readinessProbe:
           httpGet:
             path: /actuator/health  # Endpoint de readiness
-            port: 8080
+            port: 8082
           initialDelaySeconds: 5
           periodSeconds: 5
         env:
