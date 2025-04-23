@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
       - name: projet-cinema
-        image: omarelhedfi/projet_cinema:latest 
+        image: omarelhedfi/projet_cinema:1.0.60 
         imagePullPolicy: Always
         ports:
         - containerPort: 8082
