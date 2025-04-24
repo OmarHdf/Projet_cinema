@@ -1,0 +1,342 @@
+pipeline {
+    agent any
+
+    environment {
+        SONARQUBE_URL = 'http://localhost:9000'
+        SONARQUBE_TOKEN = credentials('SONARQUBE_TOKEN')
+        GITHUB_TOKEN = credentials('GITHUB_TOKEN')
+        DOCKER_IMAGE = "omarelhedfi/projet_cinema"
+        VERSION_FILE = 'version.txt'
+        POSTGRES_USER = 'sonar'
+        POSTGRES_PASSWORD = 'sonar'
+        POSTGRES_DB = 'sonarqube-postgres'
+        NEW_VERSION = "1.0.${BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Tool Check & Install') {
+            steps {
+                script {
+                    echo '🔧 Vérification des outils nécessaires...'
+                    sh 'docker --version || echo "Docker non installé"'
+                    sh 'docker-compose --version || echo "Docker Compose non installé"'
+                    sh 'trivy --version || echo "Trivy non installé"'
+                    sh 'kubectl version --client || echo "kubectl non installé"'
+                    sh 'minikube version || echo "Minikube non installé"'
+                }
+            }
+        }
+
+        stage('Clean Workspace') {
+            steps {
+                script {
+                    echo '🧹 Nettoyage de l\'espace de travail...'
+                    cleanWs()
+                }
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                script {
+                    try {
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: 'main']],
+                            userRemoteConfigs: [[
+                                url: 'https://github.com/OmarHdf/Projet_cinema.git',
+                                credentialsId: 'GITHUB_TOKEN'
+                            ]]
+                        ])
+                    } catch (err) {
+                        error("❌ Échec du checkout Git: ${err.message}")
+                    }
+                }
+            }
+        }
+
+        stage('Ensure Services Are Running') {
+            steps {
+                script {
+                    echo '🚀 Vérification que les services sont en marche...'
+                    sh '''
+                        if [ ! "$(docker ps -q -f name=sonarqube)" ]; then
+                            echo "SonarQube est arrêté, redémarrage..."
+                            docker-compose up -d sonarqube
+                        else
+                            echo "SonarQube est déjà en cours d'exécution."
+                        fi
+                        
+                        if [ ! "$(docker ps -q -f name=sonarqube-postgres)" ]; then
+                            echo "PostgreSQL est arrêté, redémarrage..."
+                            docker-compose up -d postgres
+                        else
+                            echo "PostgreSQL est déjà en cours d'exécution."
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                echo '🔍 Analyse du code avec SonarQube...'
+                withSonarQubeEnv('SonarQube_Scanner') {
+                    script {
+                        def scannerHome = tool name: 'SonarQube_Scanner', type: 'hudson.plugins.sonar.SonarRunnerInstallation'
+                        sh """
+                            ${scannerHome}/bin/sonar-scanner \
+                            -Dsonar.projectKey=Projet_cinema \
+                            -Dsonar.sources=. \
+                            -Dsonar.host.url=${SONARQUBE_URL} \
+                            -Dsonar.login=${SONARQUBE_TOKEN} \
+                            -Dsonar.projectVersion=${NEW_VERSION} \
+                            -X
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Security Scans') {
+            parallel {
+                stage('Trivy File System Scan') {
+                    steps {
+                        script {
+                            echo '🛡️ Scan des fichiers avec Trivy...'
+                            sh '''
+                                mkdir -p reports/trivy
+                                trivy fs --scanners vuln,misconfig --format json --output reports/trivy/fs-report.json .
+                                trivy fs --scanners vuln,misconfig --format table --output reports/trivy/fs-report.txt .
+                            '''
+                        }
+                    }
+                }
+
+                stage('Hadolint Dockerfile Check') {
+                    steps {
+                        script {
+                            echo '🔎 Vérification du Dockerfile avec Hadolint...'
+                            sh '''
+                                mkdir -p reports/hadolint
+                                docker run --rm -i hadolint/hadolint < Dockerfile > reports/hadolint/report.txt 2>&1 || true
+                                echo '{"issues":[' > reports/hadolint/report.json
+                                grep -o 'DL[0-9]*' reports/hadolint/report.txt | awk '{print "{\"id\":\""$1"\"},"}' >> reports/hadolint/report.json
+                                sed -i '$ s/,$//' reports/hadolint/report.json
+                                echo ']}' >> reports/hadolint/report.json
+                            '''
+                        }
+                    }
+                }
+
+            stage('Dependency-Check') {
+    steps {
+        script {
+            withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_KEY')]) {
+                // Create output directory with proper permissions
+                sh 'mkdir -p reports/dependency-check && chmod 777 reports/dependency-check'
+                
+                // Run analysis with proper credential handling
+                sh '''
+                docker run --rm \
+                    -v "${WORKSPACE}:/scan" \
+                    -v "dependency-check-cache:/usr/share/dependency-check/data" \
+                    -e data.dependencycheck.nvd.api.key=${NVD_KEY} \
+                    -e JAVA_OPTS="-Xmx4g" \
+                    owasp/dependency-check:7.4.4 \
+                    --scan /scan \
+                    --format ALL \
+                    --out /scan/reports/dependency-check \
+                    --failOnCVSS 0 \
+                    --disableRetireJS \
+                    --disableNodeAudit \
+                    --disableYarnAudit \
+                    --log /scan/reports/dependency-check/dependency-check.log
+                '''
+            }
+        }
+    }
+    post {
+        always {
+            // Archive reports regardless of success/failure
+            archiveArtifacts artifacts: 'reports/dependency-check/**', allowEmptyArchive: true
+            
+            // Publish Dependency-Check results
+            dependencyCheckPublisher pattern: 'reports/dependency-check/dependency-check-report.xml'
+            
+            // Display log if exists
+            script {
+                if (fileExists('reports/dependency-check/dependency-check.log')) {
+                    echo 'Dependency-Check Log:'
+                    sh 'tail -n 100 reports/dependency-check/dependency-check.log || true'
+                }
+            }
+        }
+    }
+}
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    echo '🔨 Construction et push de l\'image Docker...'
+                    sh "docker build --no-cache -t ${DOCKER_IMAGE}:${NEW_VERSION} ."
+                    
+                    withCredentials([usernamePassword(
+                        credentialsId: 'dockerhub',
+                        usernameVariable: 'DOCKER_USERNAME',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )]) {
+                        sh "echo ${DOCKER_PASSWORD} | docker login -u ${DOCKER_USERNAME} --password-stdin"
+                        sh "docker push ${DOCKER_IMAGE}:${NEW_VERSION}"
+                    }
+                }
+            }
+        }
+
+        stage('Image Security Scans') {
+            parallel {
+                stage('Trivy Image Scan') {
+                    steps {
+                        script {
+                            echo "🛡️ Scan de l'image Docker avec Trivy..."
+                            sh """
+                                mkdir -p reports/trivy
+                                trivy image \
+                                    --format json \
+                                    --output reports/trivy/image-report.json \
+                                    ${DOCKER_IMAGE}:${NEW_VERSION}
+                                    
+                                trivy image \
+                                    --format table \
+                                    --output reports/trivy/image-report.txt \
+                                    ${DOCKER_IMAGE}:${NEW_VERSION}
+                            """
+                        }
+                    }
+                }
+
+                stage('Dockle Scan') {
+                    steps {
+                        script {
+                            echo "🔍 Scan de l'image avec Dockle..."
+                            sh """
+                                mkdir -p reports/dockle
+                                docker run --rm \
+                                    -v /var/run/docker.sock:/var/run/docker.sock \
+                                    -v "${WORKSPACE}/reports/dockle:/out" \
+                                    goodwithtech/dockle \
+                                    -f json -o /out/report.json \
+                                    ${DOCKER_IMAGE}:${NEW_VERSION} || true
+
+                                docker run --rm \
+                                    -v /var/run/docker.sock:/var/run/docker.sock \
+                                    goodwithtech/dockle \
+                                    ${DOCKER_IMAGE}:${NEW_VERSION} > reports/dockle/report.txt 2>&1 || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+                     stage('Déploiement Kubernetes') {
+            steps {
+                script {
+                    def imageTag = "${DOCKER_IMAGE}:${NEW_VERSION}"
+                    sh "minikube status || minikube start"
+                    sh "minikube status || minikube start"
+                    sh """
+                        sed -i 's|image:.*|image: ${imageTag}|' kubernetes-deployment.yaml
+                        kubectl apply -f kubernetes-deployment.yaml
+                        kubectl rollout status deployment/projet-cinema-deployment --watch=false
+                    """
+                }
+            }
+        }
+
+
+
+
+
+stage('Get Application URL') {
+    steps {
+        script {
+            def IP = sh(script: 'minikube ip', returnStdout: true).trim()
+            env.APP_URL = "http://${IP}:30008"
+            
+            // Test avec timeout et retry
+            sh """
+                for i in {1..10}; do
+                    if curl -sS --connect-timeout 5 ${env.APP_URL}/actuator/health | grep '"status":"UP"'; then
+                        echo "✅ Application disponible à: ${env.APP_URL}"
+                        exit 0
+                    fi
+                    sleep 10
+                done
+                echo "❌ L'application n'a pas démarré correctement"
+                exit 1
+            """
+        }
+    }
+}}
+
+   post {
+    always {
+        echo '📦 Archivage des rapports...'
+        archiveArtifacts artifacts: 'reports/**/*, **/dependency-check-report.*', allowEmptyArchive: true
+
+        recordIssues(
+            tools: [
+                dependencyCheck(pattern: '**/dependency-check-report.xml'),  // Corrigé: dependencyCheck au lieu de dependency-Check
+                trivy(pattern: 'reports/trivy/*.json'),
+                hadolint(pattern: 'reports/hadolint/report.json'),
+                dockle(pattern: 'reports/dockle/report.json')
+            ],
+            enabledForFailure: true
+        )
+    }
+
+    success {
+        echo '✅ Pipeline exécutée avec succès!'
+        script {
+            try {
+                emailext(
+                    subject: "SUCCÈS: Pipeline Projet_cinema v${NEW_VERSION}",
+                    body: """La pipeline Jenkins a réussi.
+Version: ${NEW_VERSION}
+Image Docker: ${DOCKER_IMAGE}:${NEW_VERSION}
+URL de l'application: ${env.APP_URL ?: 'Non disponible'}
+Rapports: ${env.BUILD_URL}artifact/reports/
+Détails: ${env.BUILD_URL}""",
+                    to: "omarhedfi99@gmail.com",
+                    replyTo: "jenkins@example.com",
+                    attachLog: false
+                )
+            } catch (Exception e) {
+                echo "❌ Échec d'envoi d'email: ${e.getMessage()}"
+            }
+        }
+    }
+
+    failure {
+        echo '❌ Échec de la pipeline'
+        script {
+            try {
+                emailext(
+                    subject: "ÉCHEC: Pipeline Projet_cinema",
+                    body: """La pipeline Jenkins a échoué.
+Dernière version: ${NEW_VERSION ?: 'N/A'}
+Consulter les logs: ${env.BUILD_URL}console
+Détails de l'échec: ${env.BUILD_URL}""",
+                    to: "omarhedfi99@gmail.com",
+                    replyTo: "jenkins@example.com",
+                    attachLog: true
+                )
+            } catch (Exception e) {
+                echo "❌ Échec d'envoi d'email: ${e.getMessage()}"
+            }
+        }
+    }
+}}
